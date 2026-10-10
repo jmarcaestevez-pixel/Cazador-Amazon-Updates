@@ -20,7 +20,7 @@ from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-APP_VERSION = '1.8.0'
+APP_VERSION = '1.9.0'
 MANIFEST_URL = 'https://raw.githubusercontent.com/jmarcaestevez-pixel/Cazador-Amazon-Updates/main/manifest.json'
 SOURCES = [
     'https://www.amazon.es/gp/goldbox',
@@ -132,6 +132,105 @@ def parse_price(text):
         return price if 0 < price < 100000 else None
     except ValueError: return None
 
+"""Pure standard-library Flash signal extraction, scoring and rate limits."""
+import email.utils
+import html
+import re
+import time
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from urllib.parse import urlparse
+
+ASIN = re.compile(r'(?i)(?:amazon\.es/(?:[^\s"<>]*/)?(?:dp|gp/product)/|[?&]asin=)(B[0-9A-Z]{9})')
+PRICE = re.compile(r'(?<!\w)(\d{1,5}(?:[.,]\d{2}))\s*(?:€|eur)', re.I)
+PERCENT = re.compile(r'(?<!\d)(\d{1,2})\s*%')
+
+def parse_euro(text):
+    text = str(text or '').strip()
+    m = re.search(r'(\d[\d.,]*)', text)
+    if not m: return None
+    raw = m.group(1)
+    if ',' in raw: raw = raw.replace('.', '').replace(',', '.')
+    elif raw.count('.') > 1: raw = raw.replace('.', '')
+    try:
+        v = float(raw)
+        return round(v,2) if 0.01 <= v <= 100000 else None
+    except ValueError: return None
+
+def extract_asin(text):
+    m = ASIN.search(html.unescape(str(text or '')))
+    return m.group(1).upper() if m else None
+
+def feed_items(xml, source, now=None):
+    """Community signals only. Prices here are *claimed*, not verified Amazon prices."""
+    if len(xml)>2_000_000: raise ValueError('feed excesivo')
+    root=ET.fromstring(xml)
+    if root.tag.split('}')[-1] not in ('rss','feed'): raise ValueError('no es RSS/Atom')
+    result=[]
+    nodes=[n for n in root.iter() if n.tag.split('}')[-1] in ('item','entry')]
+    for node in nodes[:100]:
+        fields={}
+        for child in node:
+            k=child.tag.split('}')[-1]
+            if k in ('title','description','summary','content','link','pubDate','published','updated','guid','id'):
+                if k=='link': fields[k]=child.get('href') or (child.text or '')
+                else: fields[k]=''.join(child.itertext())[:6000]
+        title=html.unescape(re.sub('<[^>]+>',' ',fields.get('title',''))).strip()[:240]
+        body=html.unescape(re.sub('<[^>]+>',' ',fields.get('description',fields.get('summary',''))))
+        link=fields.get('link','').strip()
+        if not link.startswith('https://'): continue
+        asin=extract_asin(link+' '+body)
+        if not title: continue
+        stamp=fields.get('pubDate') or fields.get('published') or fields.get('updated')
+        age=None
+        if stamp:
+            try:
+                dt=email.utils.parsedate_to_datetime(stamp)
+                if dt is None: dt=datetime.fromisoformat(stamp.replace('Z','+00:00'))
+                if dt.tzinfo is None: dt=dt.replace(tzinfo=timezone.utc)
+                age=max(0,(now or datetime.now(timezone.utc)).timestamp()-dt.timestamp())/60
+            except (ValueError,TypeError,OverflowError): pass
+        prices=PRICE.findall(title+' '+body[:500])
+        claimed=parse_euro(prices[0]) if prices else None
+        pct=PERCENT.search(title+' '+body[:300])
+        discount=int(pct.group(1)) if pct else None
+        result.append({'source':source,'title':title,'link':link,'asin':asin,'claimed_price':claimed,
+                       'claimed_discount':discount,'age_minutes':round(age,1) if age is not None else None})
+    return result
+
+def score_signal(item):
+    """Ranking of leads, not an assertion of actual discount."""
+    score=15
+    age=item.get('age_minutes')
+    if age is not None:
+        if age<=5: score+=30
+        elif age<=15: score+=23
+        elif age<=60: score+=13
+        elif age<=180: score+=5
+    if item.get('asin'): score+=15
+    if item.get('claimed_price') is not None: score+=10
+    pct=item.get('claimed_discount')
+    if pct is not None: score+=min(25,max(0,pct-30)//2)
+    return min(100,score)
+
+def confidence(price, historical, days, repeats, seller_confirmed=False):
+    """Only own observed historical prices; minimum 3 observations on 2 days."""
+    if not price or not historical or historical<=price or days<2 or repeats<3:
+        return None
+    drop=round((historical-price)/historical*100,1)
+    if drop < 30: return None
+    return {'drop':drop,'score':min(100,round(drop*.7+min(days,30)*.4+min(repeats,15)+ (10 if seller_confirmed else 0))),
+            'verified':bool(seller_confirmed and repeats>=3 and days>=2)}
+
+class RateGate:
+    def __init__(self, seconds=60): self.seconds=seconds; self.next={}
+    def allow(self,host,now=None):
+        now=time.monotonic() if now is None else now
+        if now<self.next.get(host,0): return False
+        self.next[host]=now+self.seconds
+        return True
+
+
 def init_db():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if not DB.exists():
@@ -151,6 +250,8 @@ def init_db():
         if 'image' not in columns: c.execute('ALTER TABLE items ADD COLUMN image TEXT')
         c.execute('CREATE TABLE IF NOT EXISTS observations (asin TEXT, at TEXT, price REAL, PRIMARY KEY(asin,at))')
         c.execute('CREATE INDEX IF NOT EXISTS idx_observations_asin_at ON observations(asin,at)')
+        c.execute('CREATE TABLE IF NOT EXISTS flash_signals (link TEXT PRIMARY KEY, title TEXT, source TEXT, asin TEXT, claimed_price REAL, claimed_discount INTEGER, age_minutes REAL, score INTEGER, first_seen TEXT, last_seen TEXT)')
+        c.execute('CREATE INDEX IF NOT EXISTS idx_flash_score ON flash_signals(score DESC,first_seen DESC)')
 
 def fetch(url, limit=4_000_000):
     req = urllib.request.Request(url, headers={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36','Accept-Language':'es-ES,es;q=0.9'})
@@ -185,6 +286,65 @@ def scan():
         c.execute('INSERT INTO runs VALUES (?,?,?)',(now,status,len(found)))
     print(now,status,flush=True)
 
+# These are discovery leads from public community feeds, NOT verified Amazon prices.
+# Feed endpoints are configurable; an unavailable feed is reported, never bypassed.
+DEFAULT_FEEDS = {'Chollometro (RSS, si está disponible)': 'https://www.chollometro.com/rss'}
+
+def configured_feeds():
+    path=DATA_DIR/'fuentes_flash.json'
+    if not path.exists():
+        path.write_text(json.dumps(DEFAULT_FEEDS,ensure_ascii=False,indent=2),encoding='utf-8')
+    try:
+        obj=json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(obj,dict): return {}
+        return {str(k)[:80]:v for k,v in obj.items() if isinstance(v,str) and v.startswith('https://') and len(v)<500}
+    except (OSError,ValueError): return {}
+
+FLASH_STATUS={'at':'—','status':'Sin revisar'}
+
+def scan_flash():
+    feeds=configured_feeds()
+    found=0; errors=[]; urgent=0; now=datetime.now().isoformat(timespec='seconds')
+    for name,url in feeds.items():
+        try:
+            # No CAPTCHA evasion, login automation, proxies or high-rate crawling.
+            payload=fetch(url,limit=2_000_000)
+            signals=feed_items(payload.decode('utf-8','replace'),name)
+            with sqlite3.connect(DB) as c:
+                for x in signals:
+                    score=score_signal(x)
+                    already=c.execute('SELECT 1 FROM flash_signals WHERE link=?',(x['link'],)).fetchone()
+                    if not already and score>=70 and x['age_minutes'] is not None and x['age_minutes']<=10:
+                        urgent+=1
+                    c.execute("""INSERT INTO flash_signals VALUES (?,?,?,?,?,?,?,?,?,?)
+                                 ON CONFLICT(link) DO UPDATE SET title=excluded.title,
+                                 claimed_price=excluded.claimed_price,claimed_discount=excluded.claimed_discount,
+                                 age_minutes=excluded.age_minutes,score=excluded.score,last_seen=excluded.last_seen""",
+                              (x['link'],x['title'],x['source'],x['asin'],x['claimed_price'],x['claimed_discount'],x['age_minutes'],score,now,now))
+                    found+=1
+        except Exception as exc:
+            errors.append(f'{name}: {type(exc).__name__}')
+    FLASH_STATUS.update(at=now,status=f'{found} señales recibidas; '+('; '.join(errors) if errors else 'sin errores'))
+    if urgent and sys.platform=='win32':
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+        except Exception: pass
+    print('FLASH:',FLASH_STATUS['status'],flush=True)
+
+def flash_loop():
+    while True:
+        try: scan_flash()
+        except Exception as exc: print('FLASH error:',repr(exc),flush=True)
+        time.sleep(180)  # Three-minute discovery cadence, not real-time guarantees.
+
+def recent_flash():
+    with sqlite3.connect(DB) as c:
+        c.row_factory=sqlite3.Row
+        return [dict(x) for x in c.execute("""SELECT * FROM flash_signals
+                  WHERE substr(last_seen,1,10) >= date('now','-2 days')
+                  ORDER BY score DESC,first_seen DESC LIMIT 60""")]
+
 def scan_loop():
     while True:
         try: scan()
@@ -215,6 +375,7 @@ class Page(BaseHTTPRequestHandler):
         if self.path not in ('/','/index.html'):
             self.send_error(404); return
         latest, offers, tracking = offers_and_tracking()
+        flashes = recent_flash()
         def card(item, deal=False):
             asin = item['asin']
             title = html.escape(item['title'] or ('Amazon '+asin))
@@ -225,7 +386,17 @@ class Page(BaseHTTPRequestHandler):
             return f'<article>{pic}<section><h3>{title}</h3><p class="price">{item["price"]:.2f} €</p>{badge}{old}<p><a target="_blank" rel="noopener noreferrer" href="https://www.amazon.es/dp/{asin}">Ver en Amazon</a></p></section></article>'
         status = html.escape(str(latest['status'] if latest else 'Todavía no se ha completado una búsqueda'))
         when = html.escape(str(latest['time'] if latest else '—'))
-        page = f'''<!doctype html><html lang="es"><head><meta charset="utf-8"><meta http-equiv="refresh" content="90"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Cazador Amazon</title><style>body{{background:#101b2b;color:#f1f5ff;font:16px Arial;max-width:1050px;margin:30px auto;padding:0 18px}}h1{{color:#7de6b5}}article{{display:flex;gap:20px;background:#20324a;border-radius:12px;margin:12px 0;padding:18px}}article img,.noimg{{width:110px;height:110px;object-fit:contain;background:white;color:#445;display:grid;place-items:center;border-radius:6px;flex-shrink:0}}a{{color:#80e7b9}}small{{color:#afc3d5}}.note{{padding:14px;background:#243952;border-radius:12px}}.price{{font-size:24px;font-weight:bold}}.deal{{color:#7de6b5}}h2{{margin-top:28px}}.empty{{padding:24px;background:#20324a;border-radius:12px}}</style></head><body><h1>Cazador Amazon {APP_VERSION}</h1><div class="note">Última búsqueda: {when}<p>{status}</p><p>Las rebajas se calculan frente a observaciones del propio Cazador en días anteriores, no frente al historial completo de Amazon.</p></div><h2>Ofertas ≥70% comprobadas: {len(offers)}</h2>{''.join(card(x,True) for x in offers) if offers else '<div class="empty">0 ofertas verificadas por ahora. No se inventan precios ni descuentos.</div>'}<h2>Productos con precio en seguimiento: {len(tracking)}</h2>{''.join(card(x) for x in tracking[:80]) if tracking else '<div class="empty">Aún no hay productos con precio real. Si Amazon bloquea las consultas, aparecerá indicado arriba.</div>'}</body></html>'''
+        def flash_card(x):
+            title=html.escape(x['title'] or 'Señal sin título')
+            link=html.escape(x['link'],quote=True)
+            source=html.escape(x['source'] or '')
+            price=f"{x['claimed_price']:.2f} € (anunciado, no verificado)" if x['claimed_price'] else 'Precio por comprobar'
+            pct=f" · -{x['claimed_discount']}% anunciado" if x['claimed_discount'] is not None else ''
+            age=f" · publicado hace {x['age_minutes']:.0f} min" if x['age_minutes'] is not None else ''
+            return f'<article><section><h3>{title}</h3><p>{source}{pct}{age}</p><p>{price}</p><p><b>Prioridad de revisión: {x["score"]}/100</b></p><a target="_blank" rel="noopener noreferrer" href="{link}">Comprobar oferta en origen</a></section></article>'
+        flash_html=''.join(flash_card(x) for x in flashes[:30]) if flashes else '<div class="empty">No hay señales recientes. Comprueba el estado de las fuentes.</div>'
+        flash_status=html.escape(FLASH_STATUS['status'])
+        page = f'''<!doctype html><html lang="es"><head><meta charset="utf-8"><meta http-equiv="refresh" content="90"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Cazador Amazon</title><style>body{{background:#101b2b;color:#f1f5ff;font:16px Arial;max-width:1050px;margin:30px auto;padding:0 18px}}h1{{color:#7de6b5}}article{{display:flex;gap:20px;background:#20324a;border-radius:12px;margin:12px 0;padding:18px}}article img,.noimg{{width:110px;height:110px;object-fit:contain;background:white;color:#445;display:grid;place-items:center;border-radius:6px;flex-shrink:0}}a{{color:#80e7b9}}small{{color:#afc3d5}}.note{{padding:14px;background:#243952;border-radius:12px}}.price{{font-size:24px;font-weight:bold}}.deal{{color:#7de6b5}}h2{{margin-top:28px}}.empty{{padding:24px;background:#20324a;border-radius:12px}}</style></head><body><h1>Cazador Amazon {APP_VERSION}</h1><div class="note">Última búsqueda: {when}<p>{status}</p><p>Las rebajas se calculan frente a observaciones del propio Cazador en días anteriores, no frente al historial completo de Amazon.</p></div><h2>Señales FLASH (sin verificar): {len(flashes)}</h2><p>{flash_status}. Las señales de comunidades son pistas, no precios confirmados de Amazon. La puntuación indica prioridad, no ahorro real.</p>{flash_html}<h2>Bajadas ≥70% frente a nuestro historial: {len(offers)}</h2>{''.join(card(x,True) for x in offers) if offers else '<div class="empty">0 ofertas verificadas por ahora. No se inventan precios ni descuentos.</div>'}<h2>Productos con precio en seguimiento: {len(tracking)}</h2>{''.join(card(x) for x in tracking[:80]) if tracking else '<div class="empty">Aún no hay productos con precio real. Si Amazon bloquea las consultas, aparecerá indicado arriba.</div>'}</body></html>'''
         data = page.encode('utf-8')
         self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
     def log_message(self,*args): pass
@@ -297,6 +468,7 @@ def main():
     init_db()
     check_updates()
     threading.Thread(target=scan_loop,daemon=True).start()
+    threading.Thread(target=flash_loop,daemon=True).start()
     threading.Timer(1.5,lambda:webbrowser.open(f'http://127.0.0.1:{PORT}')).start()
     print(f'Cazador Amazon {APP_VERSION} en http://127.0.0.1:{PORT}',flush=True)
     try:
