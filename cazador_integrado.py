@@ -20,7 +20,7 @@ from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-APP_VERSION = '1.9.0'
+APP_VERSION = '2.0.0'
 MANIFEST_URL = 'https://raw.githubusercontent.com/jmarcaestevez-pixel/Cazador-Amazon-Updates/main/manifest.json'
 SOURCES = [
     'https://www.amazon.es/gp/goldbox',
@@ -170,8 +170,13 @@ def feed_items(xml, source, now=None):
     nodes=[n for n in root.iter() if n.tag.split('}')[-1] in ('item','entry')]
     for node in nodes[:100]:
         fields={}
+        images=[]
         for child in node:
             k=child.tag.split('}')[-1]
+            if k in ('thumbnail','content','enclosure','image'):
+                candidate=child.get('url') or child.get('href') or (child.text or '')
+                if candidate.startswith('https://') and (k!='enclosure' or child.get('type','').startswith('image/')):
+                    images.append(candidate)
             if k in ('title','description','summary','content','link','pubDate','published','updated','guid','id'):
                 if k=='link': fields[k]=child.get('href') or (child.text or '')
                 else: fields[k]=''.join(child.itertext())[:6000]
@@ -180,6 +185,11 @@ def feed_items(xml, source, now=None):
         link=fields.get('link','').strip()
         if not link.startswith('https://'): continue
         asin=extract_asin(link+' '+body)
+        # RSS may contain an HTML image without media:thumbnail.
+        for img in re.findall(r'<img[^>]+(?:src|data-src)=[\"\'](https://[^\"\']+)', fields.get('description','')+fields.get('content',''), re.I):
+            images.append(html.unescape(img))
+        image=next((u for u in images if safe_image_url(u)),None)
+        store=detect_store(title+' '+body+' '+link)
         if not title: continue
         stamp=fields.get('pubDate') or fields.get('published') or fields.get('updated')
         age=None
@@ -195,8 +205,21 @@ def feed_items(xml, source, now=None):
         pct=PERCENT.search(title+' '+body[:300])
         discount=int(pct.group(1)) if pct else None
         result.append({'source':source,'title':title,'link':link,'asin':asin,'claimed_price':claimed,
-                       'claimed_discount':discount,'age_minutes':round(age,1) if age is not None else None})
+                       'claimed_discount':discount,'age_minutes':round(age,1) if age is not None else None, 'image':image, 'store':store})
     return result
+
+def safe_image_url(url):
+    try:
+        p=urlparse(url)
+        return p.scheme=='https' and bool(p.hostname) and len(url)<1600 and not p.username and not p.password
+    except ValueError: return False
+
+def detect_store(text):
+    t=text.lower()
+    if 'amazon.es' in t or re.search(r'(?<![a-z])amazon(?![a-z])',t): return 'Amazon'
+    for name in ('PcComponentes','MediaMarkt','AliExpress','Carrefour','Lidl','El Corte Inglés'):
+        if name.lower() in t: return name
+    return 'Otra / sin identificar'
 
 def score_signal(item):
     """Ranking of leads, not an assertion of actual discount."""
@@ -208,6 +231,8 @@ def score_signal(item):
         elif age<=60: score+=13
         elif age<=180: score+=5
     if item.get('asin'): score+=15
+    if item.get('store')=='Amazon': score+=10
+    if item.get('image'): score+=5
     if item.get('claimed_price') is not None: score+=10
     pct=item.get('claimed_discount')
     if pct is not None: score+=min(25,max(0,pct-30)//2)
@@ -252,6 +277,9 @@ def init_db():
         c.execute('CREATE INDEX IF NOT EXISTS idx_observations_asin_at ON observations(asin,at)')
         c.execute('CREATE TABLE IF NOT EXISTS flash_signals (link TEXT PRIMARY KEY, title TEXT, source TEXT, asin TEXT, claimed_price REAL, claimed_discount INTEGER, age_minutes REAL, score INTEGER, first_seen TEXT, last_seen TEXT)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_flash_score ON flash_signals(score DESC,first_seen DESC)')
+        cols={x[1] for x in c.execute('PRAGMA table_info(flash_signals)')}
+        if 'image' not in cols: c.execute('ALTER TABLE flash_signals ADD COLUMN image TEXT')
+        if 'store' not in cols: c.execute('ALTER TABLE flash_signals ADD COLUMN store TEXT')
 
 def fetch(url, limit=4_000_000):
     req = urllib.request.Request(url, headers={'User-Agent':'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36','Accept-Language':'es-ES,es;q=0.9'})
@@ -316,11 +344,13 @@ def scan_flash():
                     already=c.execute('SELECT 1 FROM flash_signals WHERE link=?',(x['link'],)).fetchone()
                     if not already and score>=70 and x['age_minutes'] is not None and x['age_minutes']<=10:
                         urgent+=1
-                    c.execute("""INSERT INTO flash_signals VALUES (?,?,?,?,?,?,?,?,?,?)
+                    c.execute("""INSERT INTO flash_signals (link,title,source,asin,claimed_price,claimed_discount,age_minutes,score,first_seen,last_seen,image,store)
+                                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                                  ON CONFLICT(link) DO UPDATE SET title=excluded.title,
                                  claimed_price=excluded.claimed_price,claimed_discount=excluded.claimed_discount,
-                                 age_minutes=excluded.age_minutes,score=excluded.score,last_seen=excluded.last_seen""",
-                              (x['link'],x['title'],x['source'],x['asin'],x['claimed_price'],x['claimed_discount'],x['age_minutes'],score,now,now))
+                                 age_minutes=excluded.age_minutes,score=excluded.score,last_seen=excluded.last_seen,
+                                 image=COALESCE(excluded.image,flash_signals.image),store=excluded.store""",
+                              (x['link'],x['title'],x['source'],x['asin'],x['claimed_price'],x['claimed_discount'],x['age_minutes'],score,now,now,x['image'],x['store']))
                     found+=1
         except Exception as exc:
             errors.append(f'{name}: {type(exc).__name__}')
@@ -343,7 +373,7 @@ def recent_flash():
         c.row_factory=sqlite3.Row
         return [dict(x) for x in c.execute("""SELECT * FROM flash_signals
                   WHERE substr(last_seen,1,10) >= date('now','-2 days')
-                  ORDER BY score DESC,first_seen DESC LIMIT 60""")]
+                  ORDER BY score DESC,first_seen DESC LIMIT 100""")]
 
 def scan_loop():
     while True:
@@ -376,6 +406,8 @@ class Page(BaseHTTPRequestHandler):
             self.send_error(404); return
         latest, offers, tracking = offers_and_tracking()
         flashes = recent_flash()
+        amazon_flash=[x for x in flashes if x.get('store')=='Amazon' and (x.get('claimed_price') or 0)>=10 and (x.get('age_minutes') is None or x['age_minutes']<=180)]
+        other_flash=[x for x in flashes if x not in amazon_flash]
         def card(item, deal=False):
             asin = item['asin']
             title = html.escape(item['title'] or ('Amazon '+asin))
@@ -393,10 +425,13 @@ class Page(BaseHTTPRequestHandler):
             price=f"{x['claimed_price']:.2f} € (anunciado, no verificado)" if x['claimed_price'] else 'Precio por comprobar'
             pct=f" · -{x['claimed_discount']}% anunciado" if x['claimed_discount'] is not None else ''
             age=f" · publicado hace {x['age_minutes']:.0f} min" if x['age_minutes'] is not None else ''
-            return f'<article><section><h3>{title}</h3><p>{source}{pct}{age}</p><p>{price}</p><p><b>Prioridad de revisión: {x["score"]}/100</b></p><a target="_blank" rel="noopener noreferrer" href="{link}">Comprobar oferta en origen</a></section></article>'
-        flash_html=''.join(flash_card(x) for x in flashes[:30]) if flashes else '<div class="empty">No hay señales recientes. Comprueba el estado de las fuentes.</div>'
+            img=x.get('image')
+            pic=f'<img src="{html.escape(img,quote=True)}" loading="lazy" alt="" referrerpolicy="no-referrer">' if img and safe_image_url(img) else '<span class="noimg">Sin foto publicada</span>'
+            return f'<article>{pic}<section><h3>{title}</h3><p>{source}{pct}{age}</p><p>{price}</p><p><b>Prioridad de revisión: {x["score"]}/100</b></p><a target="_blank" rel="noopener noreferrer" href="{link}">Comprobar oferta en origen</a></section></article>'
+        flash_html=''.join(flash_card(x) for x in amazon_flash[:30]) if amazon_flash else '<div class="empty">Sin candidatos Amazon recientes de 10 € o más. No se inventan ofertas.</div>'
+        other_html=''.join(flash_card(x) for x in other_flash[:12]) if other_flash else '<div class="empty">Sin señales secundarias.</div>'
         flash_status=html.escape(FLASH_STATUS['status'])
-        page = f'''<!doctype html><html lang="es"><head><meta charset="utf-8"><meta http-equiv="refresh" content="90"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Cazador Amazon</title><style>body{{background:#101b2b;color:#f1f5ff;font:16px Arial;max-width:1050px;margin:30px auto;padding:0 18px}}h1{{color:#7de6b5}}article{{display:flex;gap:20px;background:#20324a;border-radius:12px;margin:12px 0;padding:18px}}article img,.noimg{{width:110px;height:110px;object-fit:contain;background:white;color:#445;display:grid;place-items:center;border-radius:6px;flex-shrink:0}}a{{color:#80e7b9}}small{{color:#afc3d5}}.note{{padding:14px;background:#243952;border-radius:12px}}.price{{font-size:24px;font-weight:bold}}.deal{{color:#7de6b5}}h2{{margin-top:28px}}.empty{{padding:24px;background:#20324a;border-radius:12px}}</style></head><body><h1>Cazador Amazon {APP_VERSION}</h1><div class="note">Última búsqueda: {when}<p>{status}</p><p>Las rebajas se calculan frente a observaciones del propio Cazador en días anteriores, no frente al historial completo de Amazon.</p></div><h2>Señales FLASH (sin verificar): {len(flashes)}</h2><p>{flash_status}. Las señales de comunidades son pistas, no precios confirmados de Amazon. La puntuación indica prioridad, no ahorro real.</p>{flash_html}<h2>Bajadas ≥70% frente a nuestro historial: {len(offers)}</h2>{''.join(card(x,True) for x in offers) if offers else '<div class="empty">0 ofertas verificadas por ahora. No se inventan precios ni descuentos.</div>'}<h2>Productos con precio en seguimiento: {len(tracking)}</h2>{''.join(card(x) for x in tracking[:80]) if tracking else '<div class="empty">Aún no hay productos con precio real. Si Amazon bloquea las consultas, aparecerá indicado arriba.</div>'}</body></html>'''
+        page = f'''<!doctype html><html lang="es"><head><meta charset="utf-8"><meta http-equiv="refresh" content="90"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Cazador Amazon</title><style>body{{background:#101b2b;color:#f1f5ff;font:16px Arial;max-width:1050px;margin:30px auto;padding:0 18px}}h1{{color:#7de6b5}}article{{display:flex;gap:20px;background:#20324a;border-radius:12px;margin:12px 0;padding:18px}}article img,.noimg{{width:110px;height:110px;object-fit:contain;background:white;color:#445;display:grid;place-items:center;border-radius:6px;flex-shrink:0}}a{{color:#80e7b9}}small{{color:#afc3d5}}.note{{padding:14px;background:#243952;border-radius:12px}}.price{{font-size:24px;font-weight:bold}}.deal{{color:#7de6b5}}h2{{margin-top:28px}}.empty{{padding:24px;background:#20324a;border-radius:12px}}</style></head><body><h1>Cazador Amazon {APP_VERSION}</h1><div class="note">Última búsqueda: {when}<p>{status}</p><p>Las rebajas se calculan frente a observaciones del propio Cazador en días anteriores, no frente al historial completo de Amazon.</p></div><h2>Candidatos FLASH Amazon (sin verificar): {len(amazon_flash)}</h2><p>{flash_status}. Las señales de comunidades son pistas, no precios confirmados de Amazon. La puntuación indica prioridad, no ahorro real.</p>{flash_html}<h2>Bajadas ≥70% frente a nuestro historial: {len(offers)}</h2>{''.join(card(x,True) for x in offers) if offers else '<div class="empty">0 ofertas verificadas por ahora. No se inventan precios ni descuentos.</div>'}<h2>Productos con precio en seguimiento: {len(tracking)}</h2>{''.join(card(x) for x in tracking[:80]) if tracking else '<div class="empty">Aún no hay productos con precio real. Si Amazon bloquea las consultas, aparecerá indicado arriba.</div>'}<h2>Otras señales de comunidad (sin verificar): {len(other_flash)}</h2>{other_html}</body></html>'''
         data = page.encode('utf-8')
         self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
     def log_message(self,*args): pass
