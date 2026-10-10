@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+import statistics
 import urllib.request
 from urllib.parse import urlparse
 import webbrowser
@@ -20,7 +21,7 @@ from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-APP_VERSION = '2.1.0'
+APP_VERSION = '2.2.0'
 MANIFEST_URL = 'https://raw.githubusercontent.com/jmarcaestevez-pixel/Cazador-Amazon-Updates/main/manifest.json'
 SOURCES = [
     'https://www.amazon.es/gp/goldbox',
@@ -137,6 +138,7 @@ import email.utils
 import html
 import re
 import time
+import statistics
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from urllib.parse import urlparse
@@ -274,6 +276,7 @@ def init_db():
         columns = {row[1] for row in c.execute('PRAGMA table_info(items)')}
         if 'image' not in columns: c.execute('ALTER TABLE items ADD COLUMN image TEXT')
         c.execute('CREATE TABLE IF NOT EXISTS observations (asin TEXT, at TEXT, price REAL, PRIMARY KEY(asin,at))')
+        c.execute('CREATE TABLE IF NOT EXISTS anomaly_alerts (asin TEXT, price REAL, baseline REAL, drop_pct REAL, at TEXT, PRIMARY KEY(asin,price))')
         c.execute('CREATE INDEX IF NOT EXISTS idx_observations_asin_at ON observations(asin,at)')
         c.execute('CREATE TABLE IF NOT EXISTS flash_signals (link TEXT PRIMARY KEY, title TEXT, source TEXT, asin TEXT, claimed_price REAL, claimed_discount INTEGER, age_minutes REAL, score INTEGER, first_seen TEXT, last_seen TEXT)')
         c.execute('CREATE INDEX IF NOT EXISTS idx_flash_score ON flash_signals(score DESC,first_seen DESC)')
@@ -383,28 +386,61 @@ def scan_loop():
         except Exception as e: print('Error:',e,flush=True)
         time.sleep(300)  # revisión cada 5 min; limitada a cuatro páginas
 
+def assess_anomaly(current, samples, now=None):
+    """Independent observations, not seller RRP, establish the baseline.
+
+    Samples are (ISO local timestamp, price). We never call a deal verified
+    until the same discounted price has been observed on two separate scans.
+    """
+    now = now or datetime.now()
+    valid=[]
+    for at,price in samples:
+        try:
+            moment=datetime.fromisoformat(at)
+            value=float(price)
+            if value>0 and value<100000 and moment<=now:
+                valid.append((moment,value))
+        except (TypeError,ValueError): pass
+    valid.sort()
+    if not valid or not (current and current>0): return None
+    prior=[(t,v) for t,v in valid if t.date()<now.date() and (now-t).days<=60]
+    if len(prior)<3 or len({t.date() for t,v in prior})<2: return None
+    # Median resists a single spurious high price, unlike MAX(price).
+    baseline=statistics.median(v for _,v in prior)
+    if baseline<=current: return None
+    drop=round((baseline-current)*100/baseline,1)
+    if drop<30: return None
+    confirmations=sum(abs(v-current)<=max(0.02,current*.002) for t,v in valid if t.date()==now.date())
+    recent=[t for t,v in valid if abs(v-current)<=max(0.02,current*.002)]
+    age=(now-min(recent)).total_seconds()/60 if recent else None
+    return {'historical_price':baseline,'drop':drop,
+            'confirmed':confirmations>=2 and len(set(t for t,v in valid if abs(v-current)<=max(0.02,current*.002)))>=2,
+            'fresh':age is not None and age<=20,'age_minutes':round(age,1) if age is not None else None}
+
+
 def offers_and_tracking():
-    """Only observations from earlier days establish historical discounts."""
+    """Only independent Amazon observations count; no community RSS deals."""
     with sqlite3.connect(DB) as c:
-        c.row_factory = sqlite3.Row
-        latest = c.execute('SELECT time,status FROM runs ORDER BY rowid DESC LIMIT 1').fetchone()
-        rows = c.execute('SELECT asin,title,price,image,last_seen FROM items WHERE price IS NOT NULL AND price > 0 ORDER BY last_seen DESC LIMIT 500').fetchall()
-        offers, tracking = [], []
+        c.row_factory=sqlite3.Row
+        latest=c.execute('SELECT time,status FROM runs ORDER BY rowid DESC LIMIT 1').fetchone()
+        rows=c.execute('SELECT asin,title,price,image,last_seen FROM items WHERE price IS NOT NULL AND price>0 ORDER BY last_seen DESC LIMIT 1000').fetchall()
+        offers,tracking=[],[]
         for row in rows:
-            d = dict(row)
-            historical = c.execute('SELECT MAX(price) FROM observations WHERE asin=? AND substr(at,1,10)<substr(?,1,10)',(d['asin'],d['last_seen'])).fetchone()[0]
-            d['historical_price'] = historical
-            d['drop'] = round(100*(1-d['price']/historical),1) if historical and historical>d['price'] else None
-            if d['drop'] is not None and d['drop'] >= 70 and d.get('image') and d.get('title') and not d['title'].startswith('Producto '):
+            d=dict(row)
+            samples=c.execute('SELECT at,price FROM observations WHERE asin=? AND price>0 ORDER BY at DESC LIMIT 1500',(d['asin'],)).fetchall()
+            try: when=datetime.fromisoformat(d['last_seen'])
+            except (ValueError,TypeError): when=datetime.now()
+            assessment=assess_anomaly(d['price'],samples,when)
+            d.update(assessment or {'historical_price':None,'drop':None,'confirmed':False,'fresh':False,'age_minutes':None})
+            valid_title=bool(d.get('title') and not d['title'].startswith('Producto '))
+            # An urgent deal needs independently observed price, name, image,
+            # repeated confirmation and a recent observation.
+            if d['confirmed'] and d['fresh'] and d['drop']>=30 and valid_title and d.get('image'):
                 offers.append(d)
             else:
                 tracking.append(d)
-            if d['drop'] is not None and d['drop'] >= 70 and d['title'] and not d['title'].startswith('Producto '):
-                offers.append(d)
-            else:
-                tracking.append(d)
-        offers.sort(key=lambda x:x['drop'],reverse=True)
-        return (dict(latest) if latest else None), offers, tracking
+        offers.sort(key=lambda x:(x['drop'], -x['age_minutes']),reverse=True)
+        return (dict(latest) if latest else None),offers,tracking
 
 class Page(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -419,8 +455,8 @@ class Page(BaseHTTPRequestHandler):
             title = html.escape(item['title'] or ('Amazon '+asin))
             image = item['image']
             pic = f'<img src="{html.escape(image,quote=True)}" loading="lazy" alt="">' if image and image.startswith('https://') else '<span class="noimg">Sin imagen</span>'
-            badge = f'<strong class="deal">-{item["drop"]:.1f}% frente al precio observado anterior</strong>' if deal else '<small>En seguimiento · sin rebaja ≥70% demostrada</small>'
-            old = f'<p>Precio observado anterior: {item["historical_price"]:.2f} €</p>' if deal else ''
+            badge = f'<strong class="deal">-{item["drop"]:.1f}% frente a la mediana de precios observados</strong>' if deal else '<small>En seguimiento · pendiente de confirmar una bajada real</small>'
+            old = f'<p>Mediana de precios anteriores: {item["historical_price"]:.2f} €</p>' if deal else ''
             return f'<article>{pic}<section><h3>{title}</h3><p class="price">{item["price"]:.2f} €</p>{badge}{old}<p><a target="_blank" rel="noopener noreferrer" href="https://www.amazon.es/dp/{asin}">Ver en Amazon</a></p></section></article>'
         status = html.escape(str(latest['status'] if latest else 'Todavía no se ha completado una búsqueda'))
         when = html.escape(str(latest['time'] if latest else '—'))
@@ -437,7 +473,7 @@ class Page(BaseHTTPRequestHandler):
         flash_html=''.join(flash_card(x) for x in amazon_flash[:30]) if amazon_flash else '<div class="empty">Sin candidatos Amazon recientes de 10 € o más. No se inventan ofertas.</div>'
         other_html=''.join(flash_card(x) for x in other_flash[:12]) if other_flash else '<div class="empty">Sin señales secundarias.</div>'
         flash_status=html.escape(FLASH_STATUS['status'])
-        page = f'''<!doctype html><html lang="es"><head><meta charset="utf-8"><meta http-equiv="refresh" content="90"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Cazador Amazon</title><style>body{{background:#101b2b;color:#f1f5ff;font:16px Arial;max-width:1050px;margin:30px auto;padding:0 18px}}h1{{color:#7de6b5}}article{{display:flex;gap:20px;background:#20324a;border-radius:12px;margin:12px 0;padding:18px}}article img,.noimg{{width:110px;height:110px;object-fit:contain;background:white;color:#445;display:grid;place-items:center;border-radius:6px;flex-shrink:0}}a{{color:#80e7b9}}small{{color:#afc3d5}}.note{{padding:14px;background:#243952;border-radius:12px}}.price{{font-size:24px;font-weight:bold}}.deal{{color:#7de6b5}}h2{{margin-top:28px}}.empty{{padding:24px;background:#20324a;border-radius:12px}}</style></head><body><h1>Cazador Amazon {APP_VERSION}</h1><div class="note">Última búsqueda: {when}<p>{status}</p><p>Las rebajas se calculan frente a observaciones del propio Cazador en días anteriores, no frente al historial completo de Amazon.</p></div><h2>Señales externas desactivadas (no buscamos ofertas ya publicadas): {len(amazon_flash)}</h2><p>{flash_status}. Las señales de comunidades son pistas, no precios confirmados de Amazon. La puntuación indica prioridad, no ahorro real.</p>{flash_html}<h2>Bajadas ≥70% frente a nuestro historial: {len(offers)}</h2>{''.join(card(x,True) for x in offers) if offers else '<div class="empty">0 ofertas verificadas por ahora. No se inventan precios ni descuentos.</div>'}<h2>Productos con precio en seguimiento: {len(tracking)}</h2>{''.join(card(x) for x in tracking[:80]) if tracking else '<div class="empty">Aún no hay productos con precio real. Si Amazon bloquea las consultas, aparecerá indicado arriba.</div>'}<h2>Otras señales externas (desactivadas por defecto): {len(other_flash)}</h2>{other_html}</body></html>'''
+        page = f'''<!doctype html><html lang="es"><head><meta charset="utf-8"><meta http-equiv="refresh" content="90"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Cazador Amazon</title><style>body{{background:#101b2b;color:#f1f5ff;font:16px Arial;max-width:1050px;margin:30px auto;padding:0 18px}}h1{{color:#7de6b5}}article{{display:flex;gap:20px;background:#20324a;border-radius:12px;margin:12px 0;padding:18px}}article img,.noimg{{width:110px;height:110px;object-fit:contain;background:white;color:#445;display:grid;place-items:center;border-radius:6px;flex-shrink:0}}a{{color:#80e7b9}}small{{color:#afc3d5}}.note{{padding:14px;background:#243952;border-radius:12px}}.price{{font-size:24px;font-weight:bold}}.deal{{color:#7de6b5}}h2{{margin-top:28px}}.empty{{padding:24px;background:#20324a;border-radius:12px}}</style></head><body><h1>Cazador Amazon {APP_VERSION}</h1><div class="note">Última búsqueda: {when}<p>{status}</p><p>Las alertas se basan en la mediana de al menos 3 observaciones en 2 días distintos, más 2 confirmaciones del precio bajo. No se garantiza que la oferta siga disponible.</p></div><h2>Radar independiente: solo bajadas detectadas por Cazador</h2><p>Sin Chollometro, Duck ni agregadores. Se requieren varias observaciones reales de Amazon en días distintos y una segunda comprobación del precio bajo.</p><h2>Caídas confirmadas ≥30% (prioridad a las ≥70%): {len(offers)}</h2>{''.join(card(x,True) for x in offers) if offers else '<div class="empty">0 ofertas verificadas por ahora. No se inventan precios ni descuentos.</div>'}<h2>Productos con precio en seguimiento: {len(tracking)}</h2>{''.join(card(x) for x in tracking[:80]) if tracking else '<div class="empty">Aún no hay productos con precio real. Si Amazon bloquea las consultas, aparecerá indicado arriba.</div>'}</body></html>'''
         data = page.encode('utf-8')
         self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
     def log_message(self,*args): pass
