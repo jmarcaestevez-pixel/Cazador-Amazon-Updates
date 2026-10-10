@@ -20,7 +20,7 @@ from html.parser import HTMLParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-APP_VERSION = '2.0.0'
+APP_VERSION = '2.1.0'
 MANIFEST_URL = 'https://raw.githubusercontent.com/jmarcaestevez-pixel/Cazador-Amazon-Updates/main/manifest.json'
 SOURCES = [
     'https://www.amazon.es/gp/goldbox',
@@ -316,7 +316,7 @@ def scan():
 
 # These are discovery leads from public community feeds, NOT verified Amazon prices.
 # Feed endpoints are configurable; an unavailable feed is reported, never bypassed.
-DEFAULT_FEEDS = {'Chollometro (RSS, si está disponible)': 'https://www.chollometro.com/rss'}
+DEFAULT_FEEDS = {}  # Desactivado: no perseguimos ofertas ya publicadas
 
 def configured_feeds():
     path=DATA_DIR/'fuentes_flash.json'
@@ -325,6 +325,8 @@ def configured_feeds():
     try:
         obj=json.loads(path.read_text(encoding='utf-8'))
         if not isinstance(obj,dict): return {}
+        # Desactivar también feeds heredados de instalaciones anteriores.
+        obj={k:v for k,v in obj.items() if not any(site in (k+' '+v).lower() for site in ('chollometro','the deal duck','thedealduck','grandesofertas'))}
         return {str(k)[:80]:v for k,v in obj.items() if isinstance(v,str) and v.startswith('https://') and len(v)<500}
     except (OSError,ValueError): return {}
 
@@ -379,7 +381,7 @@ def scan_loop():
     while True:
         try: scan()
         except Exception as e: print('Error:',e,flush=True)
-        time.sleep(900)
+        time.sleep(300)  # revisión cada 5 min; limitada a cuatro páginas
 
 def offers_and_tracking():
     """Only observations from earlier days establish historical discounts."""
@@ -393,6 +395,10 @@ def offers_and_tracking():
             historical = c.execute('SELECT MAX(price) FROM observations WHERE asin=? AND substr(at,1,10)<substr(?,1,10)',(d['asin'],d['last_seen'])).fetchone()[0]
             d['historical_price'] = historical
             d['drop'] = round(100*(1-d['price']/historical),1) if historical and historical>d['price'] else None
+            if d['drop'] is not None and d['drop'] >= 70 and d.get('image') and d.get('title') and not d['title'].startswith('Producto '):
+                offers.append(d)
+            else:
+                tracking.append(d)
             if d['drop'] is not None and d['drop'] >= 70 and d['title'] and not d['title'].startswith('Producto '):
                 offers.append(d)
             else:
@@ -431,7 +437,7 @@ class Page(BaseHTTPRequestHandler):
         flash_html=''.join(flash_card(x) for x in amazon_flash[:30]) if amazon_flash else '<div class="empty">Sin candidatos Amazon recientes de 10 € o más. No se inventan ofertas.</div>'
         other_html=''.join(flash_card(x) for x in other_flash[:12]) if other_flash else '<div class="empty">Sin señales secundarias.</div>'
         flash_status=html.escape(FLASH_STATUS['status'])
-        page = f'''<!doctype html><html lang="es"><head><meta charset="utf-8"><meta http-equiv="refresh" content="90"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Cazador Amazon</title><style>body{{background:#101b2b;color:#f1f5ff;font:16px Arial;max-width:1050px;margin:30px auto;padding:0 18px}}h1{{color:#7de6b5}}article{{display:flex;gap:20px;background:#20324a;border-radius:12px;margin:12px 0;padding:18px}}article img,.noimg{{width:110px;height:110px;object-fit:contain;background:white;color:#445;display:grid;place-items:center;border-radius:6px;flex-shrink:0}}a{{color:#80e7b9}}small{{color:#afc3d5}}.note{{padding:14px;background:#243952;border-radius:12px}}.price{{font-size:24px;font-weight:bold}}.deal{{color:#7de6b5}}h2{{margin-top:28px}}.empty{{padding:24px;background:#20324a;border-radius:12px}}</style></head><body><h1>Cazador Amazon {APP_VERSION}</h1><div class="note">Última búsqueda: {when}<p>{status}</p><p>Las rebajas se calculan frente a observaciones del propio Cazador en días anteriores, no frente al historial completo de Amazon.</p></div><h2>Candidatos FLASH Amazon (sin verificar): {len(amazon_flash)}</h2><p>{flash_status}. Las señales de comunidades son pistas, no precios confirmados de Amazon. La puntuación indica prioridad, no ahorro real.</p>{flash_html}<h2>Bajadas ≥70% frente a nuestro historial: {len(offers)}</h2>{''.join(card(x,True) for x in offers) if offers else '<div class="empty">0 ofertas verificadas por ahora. No se inventan precios ni descuentos.</div>'}<h2>Productos con precio en seguimiento: {len(tracking)}</h2>{''.join(card(x) for x in tracking[:80]) if tracking else '<div class="empty">Aún no hay productos con precio real. Si Amazon bloquea las consultas, aparecerá indicado arriba.</div>'}<h2>Otras señales de comunidad (sin verificar): {len(other_flash)}</h2>{other_html}</body></html>'''
+        page = f'''<!doctype html><html lang="es"><head><meta charset="utf-8"><meta http-equiv="refresh" content="90"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Cazador Amazon</title><style>body{{background:#101b2b;color:#f1f5ff;font:16px Arial;max-width:1050px;margin:30px auto;padding:0 18px}}h1{{color:#7de6b5}}article{{display:flex;gap:20px;background:#20324a;border-radius:12px;margin:12px 0;padding:18px}}article img,.noimg{{width:110px;height:110px;object-fit:contain;background:white;color:#445;display:grid;place-items:center;border-radius:6px;flex-shrink:0}}a{{color:#80e7b9}}small{{color:#afc3d5}}.note{{padding:14px;background:#243952;border-radius:12px}}.price{{font-size:24px;font-weight:bold}}.deal{{color:#7de6b5}}h2{{margin-top:28px}}.empty{{padding:24px;background:#20324a;border-radius:12px}}</style></head><body><h1>Cazador Amazon {APP_VERSION}</h1><div class="note">Última búsqueda: {when}<p>{status}</p><p>Las rebajas se calculan frente a observaciones del propio Cazador en días anteriores, no frente al historial completo de Amazon.</p></div><h2>Señales externas desactivadas (no buscamos ofertas ya publicadas): {len(amazon_flash)}</h2><p>{flash_status}. Las señales de comunidades son pistas, no precios confirmados de Amazon. La puntuación indica prioridad, no ahorro real.</p>{flash_html}<h2>Bajadas ≥70% frente a nuestro historial: {len(offers)}</h2>{''.join(card(x,True) for x in offers) if offers else '<div class="empty">0 ofertas verificadas por ahora. No se inventan precios ni descuentos.</div>'}<h2>Productos con precio en seguimiento: {len(tracking)}</h2>{''.join(card(x) for x in tracking[:80]) if tracking else '<div class="empty">Aún no hay productos con precio real. Si Amazon bloquea las consultas, aparecerá indicado arriba.</div>'}<h2>Otras señales externas (desactivadas por defecto): {len(other_flash)}</h2>{other_html}</body></html>'''
         data = page.encode('utf-8')
         self.send_response(200);self.send_header('Content-Type','text/html; charset=utf-8');self.send_header('Content-Length',str(len(data)));self.end_headers();self.wfile.write(data)
     def log_message(self,*args): pass
