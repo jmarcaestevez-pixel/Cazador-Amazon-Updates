@@ -1,0 +1,46 @@
+name: Compilar y publicar Cazador Windows
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'cazador_integrado.py'
+      - '.github/workflows/publicar-windows.yml'
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Comprobar código
+        run: |
+          python -m py_compile cazador_integrado.py
+          python -c "import cazador_integrado as a; assert a.parse_price('12,99 €') == 12.99; assert a.newer('1.6.1','1.6.0')"
+      - name: Instalar PyInstaller
+        run: python -m pip install pyinstaller==6.16.0
+      - name: Compilar EXE
+        run: python -m PyInstaller --onefile --console --name CAZADOR_AMAZON cazador_integrado.py
+      - name: Publicar ejecutable y manifiesto
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force bin | Out-Null
+          Copy-Item dist/CAZADOR_AMAZON.exe bin/CAZADOR_AMAZON.exe -Force
+          $hash = (Get-FileHash bin/CAZADOR_AMAZON.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          $version = (Select-String -Path cazador_integrado.py -Pattern "^APP_VERSION = '([^']+)'" ).Matches.Groups[1].Value
+          $manifest = @{version=$version;url='https://raw.githubusercontent.com/jmarcaestevez-pixel/Cazador-Amazon-Updates/main/bin/CAZADOR_AMAZON.exe';sha256=$hash} | ConvertTo-Json -Compress
+          Set-Content -Path manifest.json -Value $manifest -Encoding utf8
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bin/CAZADOR_AMAZON.exe manifest.json
+          git diff --cached --quiet
+          if ($LASTEXITCODE -ne 0) {
+            git commit -m "Publicar Cazador Amazon $version [skip ci]"
+            git push
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CAZADOR_AMAZON-Windows
+          path: dist/CAZADOR_AMAZON.exe
