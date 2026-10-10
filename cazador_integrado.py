@@ -430,7 +430,8 @@ def offers_and_tracking():
             samples=c.execute('SELECT at,price FROM observations WHERE asin=? AND price>0 ORDER BY at DESC LIMIT 1500',(d['asin'],)).fetchall()
             try: when=datetime.fromisoformat(d['last_seen'])
             except (ValueError,TypeError): when=datetime.now()
-            assessment=assess_anomaly(d['price'],samples,when)
+            assessment=assess_anomaly(d['price'],samples,datetime.now())
+            if (datetime.now()-when).total_seconds()>1200: assessment=None
             d.update(assessment or {'historical_price':None,'drop':None,'confirmed':False,'fresh':False,'age_minutes':None})
             valid_title=bool(d.get('title') and not d['title'].startswith('Producto '))
             # An urgent deal needs independently observed price, name, image,
